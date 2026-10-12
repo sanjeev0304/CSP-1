@@ -33,6 +33,45 @@ export interface FileText {
   actual_chars: number;
 }
 
+export interface BlockedUpload {
+  id: string;
+  incoming_filename: string;
+  sha256_hash: string;
+  physical_blob_id: string | null;
+  created_at: string;
+}
+
+export interface MatchedFileRef {
+  id: string;
+  filename: string;
+}
+
+/** What process-upload can answer with. */
+export type UploadResponse =
+  | {
+      tier: 1;
+      deduplicated: true;
+      logical_file_id: string;
+      sha256: string;
+      message: string;
+    }
+  | {
+      tier: 2;
+      deduplicated: false;
+      logical_file_id: string;
+      sha256: string;
+      extraction_ok: boolean;
+      extraction_reason: string | null;
+      shingle_count: number;
+      near_duplicate_pairs: number;
+    }
+  | {
+      status: "blocked_duplicate";
+      notice_id: string;
+      incoming_filename: string;
+      matches: MatchedFileRef[];
+    };
+
 export const CONFIDENCE_LABEL: Record<Confidence, string> = {
   high: "High confidence",
   "metadata-only": "Metadata only — content couldn't be compared",

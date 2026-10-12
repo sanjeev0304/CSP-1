@@ -6,8 +6,9 @@ import { Uploader } from "./components/Uploader";
 import { FileList } from "./components/FileList";
 import { DuplicatesPanel } from "./components/DuplicatesPanel";
 import { ComparisonView } from "./components/ComparisonView";
+import { MessagesPanel } from "./components/MessagesPanel";
 import { Dashboard, type DashboardStats } from "./components/Dashboard";
-import type { LogicalFile, NearDuplicatePair } from "./lib/types";
+import type { BlockedUpload, LogicalFile, NearDuplicatePair } from "./lib/types";
 
 type Tab = "files" | "duplicates" | "dashboard";
 
@@ -22,6 +23,7 @@ export default function App() {
   const [filterFileId, setFilterFileId] = useState<string | null>(null);
   const [selectedPairId, setSelectedPairId] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [notices, setNotices] = useState<BlockedUpload[]>([]);
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => {
@@ -63,9 +65,29 @@ export default function App() {
     setBlobCount(blobs.length);
   }, []);
 
+  const refreshNotices = useCallback(async () => {
+    const { data, error } = await supabase
+      .from("blocked_uploads")
+      .select("id, incoming_filename, sha256_hash, physical_blob_id, created_at")
+      .order("created_at", { ascending: false });
+    if (!error) setNotices((data ?? []) as BlockedUpload[]);
+  }, []);
+
+  // Signed-out: drop everything user-specific.
   useEffect(() => {
-    if (session) void reload();
-  }, [session, reload]);
+    if (!session) {
+      setNotices([]);
+      setFiles([]);
+      setPairs([]);
+    }
+  }, [session]);
+
+  useEffect(() => {
+    if (session) {
+      void reload();
+      void refreshNotices();
+    }
+  }, [session, reload, refreshNotices]);
 
   const filesById = useMemo(
     () => new Map(files.map((f) => [f.id, f])),
@@ -141,6 +163,14 @@ export default function App() {
           </button>
         </nav>
         <div className="topbar-right">
+          <MessagesPanel
+            notices={notices}
+            allFiles={files}
+            onAfterChange={() => {
+              void reload();
+              void refreshNotices();
+            }}
+          />
           <span className="muted small">{session.user.email}</span>
           <button className="link" onClick={() => supabase.auth.signOut()}>
             Sign out
@@ -153,7 +183,10 @@ export default function App() {
 
         {tab === "files" && (
           <>
-            <Uploader onUploaded={() => void reload()} />
+            <Uploader
+              onUploaded={() => void reload()}
+              onNoticesChanged={() => void refreshNotices()}
+            />
             <FileList
               files={files}
               pendingCounts={pendingCounts}

@@ -33,6 +33,108 @@ const SIZE_BUCKET_RATIO = 1.2;
 const INSERT_CHUNK = 500;
 const HASH_CHUNK = 800;
 
+/**
+ * Shared Tier-1 linking path: the caller has an existing blob whose SHA-256
+ * matches the incoming bytes. Under the block-exact-duplicates feature this
+ * attempt is NOT linked: no logical_files row, no ref_count change, no Storage
+ * write. Instead a blocked_uploads notice is upserted (created_at refreshed)
+ * and the response tells the client which existing file(s) it duplicated.
+ * If no logical file references the blob (unreachable in practice), fall back
+ * to the previous linking behaviour so nothing regresses.
+ */
+async function blockOrLinkDuplicate(
+  supabase: ReturnType<typeof createClient>,
+  user: { id: string },
+  existingBlobId: string,
+  upload: {
+    filename: string;
+    filename_stem: string;
+    extension: string;
+    size_bytes: number;
+  },
+  sha: string,
+): Promise<Response> {
+  const { data: matches, error: matchesErr } = await supabase
+    .from("logical_files")
+    .select("id, filename")
+    .eq("blob_id", existingBlobId)
+    .order("uploaded_at", { ascending: true });
+  if (matchesErr) return json({ error: matchesErr.message }, 500);
+
+  if (!matches || matches.length === 0) {
+    // Unreachable unless a blob lost all references; keep old behaviour.
+    return linkToBlob(supabase, user, existingBlobId, upload, sha);
+  }
+
+  const { data: notice, error: noticeErr } = await supabase
+    .from("blocked_uploads")
+    .upsert(
+      {
+        user_id: user.id,
+        incoming_filename: upload.filename,
+        sha256_hash: sha,
+        physical_blob_id: existingBlobId,
+        filename_stem: upload.filename_stem,
+        extension: upload.extension,
+        size_bytes: upload.size_bytes,
+        created_at: new Date().toISOString(),
+      },
+      { onConflict: "user_id,sha256_hash,incoming_filename" },
+    )
+    .select("id")
+    .single();
+  if (noticeErr || !notice) {
+    // Never silently drop a file: surface the failure instead.
+    return json(
+      { error: noticeErr?.message ?? "blocked-duplicate notice write failed" },
+      500,
+    );
+  }
+
+  return json({
+    status: "blocked_duplicate",
+    notice_id: notice.id,
+    incoming_filename: upload.filename,
+    matches: matches.map((m) => ({ id: m.id, filename: m.filename })),
+  });
+}
+
+/** The previous Tier-1 behaviour, only used when no reference exists. */
+async function linkToBlob(
+  supabase: ReturnType<typeof createClient>,
+  user: { id: string },
+  existingBlobId: string,
+  upload: {
+    filename: string;
+    filename_stem: string;
+    extension: string;
+    size_bytes: number;
+  },
+  sha: string,
+): Promise<Response> {
+  await supabase.rpc("increment_blob_ref", { p_blob_id: existingBlobId });
+  const { data: lf, error: lfErr } = await supabase
+    .from("logical_files")
+    .insert({
+      user_id: user.id,
+      blob_id: existingBlobId,
+      filename: upload.filename,
+      filename_stem: upload.filename_stem,
+      extension: upload.extension,
+      size_bytes: upload.size_bytes,
+    })
+    .select("id")
+    .single();
+  if (lfErr) return json({ error: lfErr.message }, 500);
+  return json({
+    tier: 1,
+    deduplicated: true,
+    logical_file_id: lf.id,
+    sha256: sha,
+    message: "Identical bytes already stored; reused existing blob.",
+  });
+}
+
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers":
@@ -91,27 +193,12 @@ Deno.serve(async (req) => {
       .maybeSingle();
 
     if (existingBlob) {
-      await supabase.rpc("increment_blob_ref", { p_blob_id: existingBlob.id });
-      const { data: lf, error: lfErr } = await supabase
-        .from("logical_files")
-        .insert({
-          user_id: user.id,
-          blob_id: existingBlob.id,
-          filename,
-          filename_stem: stem,
-          extension,
-          size_bytes: sizeBytes,
-        })
-        .select("id")
-        .single();
-      if (lfErr) return json({ error: lfErr.message }, 500);
-      return json({
-        tier: 1,
-        deduplicated: true,
-        logical_file_id: lf.id,
-        sha256: sha,
-        message: "Identical bytes already stored; reused existing blob.",
-      });
+      return blockOrLinkDuplicate(supabase, user, existingBlob.id, {
+        filename,
+        filename_stem: stem,
+        extension,
+        size_bytes: sizeBytes,
+      }, sha);
     }
 
     const storagePath = `${user.id}/${sha}`;
@@ -150,27 +237,12 @@ Deno.serve(async (req) => {
           .eq("sha256_hash", sha)
           .maybeSingle();
         if (existingBlob) {
-          await supabase.rpc("increment_blob_ref", { p_blob_id: existingBlob.id });
-          const { data: lf, error: lfErr } = await supabase
-            .from("logical_files")
-            .insert({
-              user_id: user.id,
-              blob_id: existingBlob.id,
-              filename,
-              filename_stem: stem,
-              extension,
-              size_bytes: sizeBytes,
-            })
-            .select("id")
-            .single();
-          if (lfErr) return json({ error: lfErr.message }, 500);
-          return json({
-            tier: 1,
-            deduplicated: true,
-            logical_file_id: lf.id,
-            sha256: sha,
-            message: "Identical bytes already stored; reused existing blob.",
-          });
+          return blockOrLinkDuplicate(supabase, user, existingBlob.id, {
+            filename,
+            filename_stem: stem,
+            extension,
+            size_bytes: sizeBytes,
+          }, sha);
         }
       }
       return json({ error: blobError.message }, 500);

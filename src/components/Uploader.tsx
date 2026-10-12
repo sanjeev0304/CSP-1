@@ -1,19 +1,20 @@
 import { useRef, useState } from "react";
 import { supabase } from "../lib/supabase";
+import type { UploadResponse } from "../lib/types";
+
+/** True only for the non-blocking upload responses (no `status` field). */
+function isStoredResult(
+  r: UploadResponse,
+): r is Extract<UploadResponse, { deduplicated: boolean }> {
+  return "deduplicated" in r;
+}
 
 interface Props {
   onUploaded: () => void;
+  onNoticesChanged: () => void;
 }
 
-interface UploadResult {
-  tier: 1 | 2;
-  deduplicated: boolean;
-  extraction_ok?: boolean;
-  extraction_reason?: string;
-  near_duplicate_pairs?: number;
-}
-
-export function Uploader({ onUploaded }: Props) {
+export function Uploader({ onUploaded, onNoticesChanged }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [busy, setBusy] = useState(false);
   const [log, setLog] = useState<string[]>([]);
@@ -25,27 +26,39 @@ export function Uploader({ onUploaded }: Props) {
     setError(null);
     setLog([]);
     const messages: string[] = [];
+    let anyBlocked = false;
     try {
       for (const file of Array.from(files)) {
         const form = new FormData();
         form.append("file", file);
-        const { data, error } = await supabase.functions.invoke<UploadResult>(
+        const { data, error } = await supabase.functions.invoke<UploadResponse>(
           "process-upload",
           { body: form },
         );
         if (error) throw new Error(`${file.name}: ${error.message}`);
         if (data) {
-          if (data.deduplicated) {
-            messages.push(
-              `${file.name}: identical bytes already stored — shared blob (Tier 1).`,
-            );
+          if (isStoredResult(data)) {
+            // Tier 1 (fallback linking path — no extraction ran) or Tier 2.
+            if (data.tier === 1) {
+              messages.push(
+                `${file.name}: identical bytes already stored; reused existing blob (fallback).`,
+              );
+            } else {
+              const note = data.extraction_ok
+                ? "text extracted"
+                : `metadata-only (${data.extraction_reason ?? "no text"})`;
+              messages.push(
+                `${file.name}: stored — ${note}; ${data.near_duplicate_pairs} possible duplicate(s).`,
+              );
+            }
           } else {
-            const note = data.extraction_ok
-              ? "text extracted"
-              : `metadata-only (${data.extraction_reason ?? "no text"})`;
+            // Blocked duplicate: NOT counted as uploaded; a message is
+            // recorded and can be approved from the Messages inbox.
+            const first = data.matches[0]?.filename ?? "an existing file";
             messages.push(
-              `${file.name}: stored — ${note}; ${data.near_duplicate_pairs ?? 0} possible duplicate(s).`,
+              `${data.incoming_filename}: not added — exact copy of ${first}. See Messages.`,
             );
+            anyBlocked = true;
           }
         }
       }
@@ -55,6 +68,8 @@ export function Uploader({ onUploaded }: Props) {
       setError((err as Error).message);
     } finally {
       setBusy(false);
+      // Refresh the messages inbox after each batch finishes (blocked or not).
+      if (anyBlocked) onNoticesChanged();
       if (inputRef.current) inputRef.current.value = "";
     }
   }
