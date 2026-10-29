@@ -14,9 +14,11 @@ createdb "$DB"
 echo "── stubs ─────────────────────────────────────────────"
 psql -q -v ON_ERROR_STOP=1 -d "$DB" -f "$ROOT/tests/sql/00_stubs.sql"
 
-echo "── migration ─────────────────────────────────────────"
-psql -q -v ON_ERROR_STOP=1 -d "$DB" -f "$ROOT/supabase/migrations/0001_init.sql" 2>&1 \
-  | grep -v 'does not exist, skipping' || true
+echo "── migrations ────────────────────────────────────────"
+for m in "$ROOT"/supabase/migrations/*.sql; do
+  psql -q -v ON_ERROR_STOP=1 -d "$DB" -f "$m" 2>&1 \
+    | grep -v 'does not exist, skipping' || true
+done
 
 echo "── scenario ──────────────────────────────────────────"
 psql -v ON_ERROR_STOP=1 -d "$DB" -f "$ROOT/tests/sql/10_scenario.sql" 2>&1 \

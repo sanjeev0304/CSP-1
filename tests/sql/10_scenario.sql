@@ -183,6 +183,85 @@ select public._t_assert(
   (select count(*) from public.physical_blobs where sha256_hash = 'deadbeef') = 2,
   'the same sha256 coexists across users (per-user uniqueness, not global)');
 
+-- ===========================================================================
+-- Blocked uploads & approve_blocked_upload: syncs duplicates into Duplicates tab
+-- ===========================================================================
+set role authenticated;
+set request.jwt.claim.sub = '11111111-1111-1111-1111-111111111111';
+
+select public._t_assert(
+  public.filename_similarity('report', 'Report') = 1.0,
+  'filename_similarity handles case-insensitivity');
+
+select public._t_assert(
+  public.filename_similarity('kitten', 'sitting') > 0.57 and public.filename_similarity('kitten', 'sitting') < 0.58,
+  'filename_similarity matches Levenshtein distance');
+
+-- Upload an initial file with text and shingles
+do $$
+declare
+  v_blob_id uuid;
+  v_file_id uuid;
+  v_notice_id uuid;
+  v_approved_id uuid;
+begin
+  select id into v_blob_id from public.physical_blobs
+   where user_id = '11111111-1111-1111-1111-111111111111' limit 1;
+
+  insert into public.logical_files
+    (user_id, blob_id, filename, filename_stem, extension, size_bytes)
+  values
+    ('11111111-1111-1111-1111-111111111111', v_blob_id, 'Original Document.docx', 'Original Document', 'docx', 1000)
+  returning id into v_file_id;
+
+  insert into public.logical_files_text
+    (logical_file_id, user_id, extracted_text, extraction_ok, expected_min_chars, actual_chars, extraction_reason)
+  values
+    (v_file_id, '11111111-1111-1111-1111-111111111111', 'Sample extracted content of document', true, 300, 37, 'ok');
+
+  insert into public.file_shingles
+    (logical_file_id, user_id, shingle_hash, start_offset)
+  values
+    (v_file_id, '11111111-1111-1111-1111-111111111111', 123456789, 0);
+
+  -- A duplicate upload arrives and is recorded as blocked
+  insert into public.blocked_uploads
+    (user_id, incoming_filename, sha256_hash, physical_blob_id, filename_stem, extension, size_bytes)
+  values
+    ('11111111-1111-1111-1111-111111111111', 'Original Document copy.docx', 'deadbeef', v_blob_id, 'Original Document copy', 'docx', 1000)
+  returning id into v_notice_id;
+
+  -- User approves the blocked duplicate
+  v_approved_id := public.approve_blocked_upload(v_notice_id);
+
+  insert into public._t_ids (name, val) values ('approved_file', v_approved_id);
+  insert into public._t_ids (name, val) values ('orig_file', v_file_id);
+end $$;
+
+select public._t_assert(
+  (select count(*) from public.blocked_uploads where user_id = '11111111-1111-1111-1111-111111111111') = 0,
+  'approve_blocked_upload removed notice from blocked_uploads');
+
+select public._t_assert(
+  (select count(*) from public.logical_files_text where logical_file_id = (select val from public._t_ids where name = 'approved_file')) = 1,
+  'approve_blocked_upload copied logical_files_text to new file');
+
+select public._t_assert(
+  (select count(*) from public.file_shingles where logical_file_id = (select val from public._t_ids where name = 'approved_file')) = 1,
+  'approve_blocked_upload copied file_shingles to new file');
+
+select public._t_assert(
+  (select count(*) from public.near_duplicate_pairs
+    where (file_a_id = (select val from public._t_ids where name = 'approved_file')
+        or file_b_id = (select val from public._t_ids where name = 'approved_file'))
+      and status = 'pending'
+      and confidence = 'high'
+      and content_score = 1.0) = 1,
+  'approve_blocked_upload created pending near_duplicate_pair with content_score=1.0 and high confidence');
+
+reset role;
+
 do $$ begin
   raise notice 'ALL SQL SCENARIO ASSERTIONS PASSED';
 end $$;
+
